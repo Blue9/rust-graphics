@@ -12,6 +12,13 @@ use winit::{
     window::WindowBuilder,
 };
 
+#[derive(serde::Deserialize)]
+#[repr(C)]
+struct Vertex {
+    position: [f32; 3],
+    normal: [f32; 3],
+}
+
 struct Resources<B: gfx_hal::Backend> {
     instance: B::Instance,
     surface: B::Surface,
@@ -22,6 +29,8 @@ struct Resources<B: gfx_hal::Backend> {
     command_pool: B::CommandPool,
     submission_complete_fence: B::Fence,
     rendering_complete_semaphore: B::Semaphore,
+    vertex_buffer_memory: B::Memory,
+    vertex_buffer: B::Buffer,
 }
 
 struct ResourceHolder<B: gfx_hal::Backend>(ManuallyDrop<Resources<B>>);
@@ -39,7 +48,12 @@ impl<B: gfx_hal::Backend> Drop for ResourceHolder<B> {
                 pipelines,
                 submission_complete_fence,
                 rendering_complete_semaphore,
+                vertex_buffer_memory,
+                vertex_buffer,
             } = ManuallyDrop::take(&mut self.0);
+
+            device.free_memory(vertex_buffer_memory);
+            device.destroy_buffer(vertex_buffer);
 
             device.destroy_semaphore(rendering_complete_semaphore);
             device.destroy_fence(submission_complete_fence);
@@ -62,13 +76,11 @@ impl<B: gfx_hal::Backend> Drop for ResourceHolder<B> {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct PushConstants {
-    color: [f32; 4],
-    pos: [f32; 2],
-    scale: [f32; 2],
+    transform: [[f32; 4]; 4],
 }
 
 fn main() {
-    let name = "Triangle";
+    let name = "Teapot";
     let window_size = [800, 600];
 
     let event_loop = EventLoop::new();
@@ -145,6 +157,37 @@ fn main() {
             .unwrap_or(default_format)
     };
 
+    let binary_mesh_data = include_bytes!("assets/teapot_mesh.bin");
+    let mesh: Vec<Vertex> =
+        bincode::deserialize(binary_mesh_data).expect("Failed to deserialize mesh");
+
+    let vertex_buffer_len = mesh.len() * std::mem::size_of::<Vertex>();
+    let (vertex_buffer_memory, vertex_buffer) = unsafe {
+        use gfx_hal::buffer::Usage;
+        use gfx_hal::memory::Properties;
+
+        make_buffer::<backend::Backend>(
+            &device,
+            &adapter.physical_device,
+            vertex_buffer_len,
+            Usage::VERTEX,
+            Properties::CPU_VISIBLE,
+        )
+    };
+
+    unsafe {
+        use gfx_hal::memory::Segment;
+
+        let mapped_memory = device
+            .map_memory(&vertex_buffer_memory, Segment::ALL)
+            .expect("Failed to map memory");
+        std::ptr::copy_nonoverlapping(mesh.as_ptr() as *const u8, mapped_memory, vertex_buffer_len);
+        device
+            .flush_mapped_memory_ranges(vec![(&vertex_buffer_memory, Segment::ALL)])
+            .expect("Failed to flush memory");
+        device.unmap_memory(&vertex_buffer_memory);
+    }
+
     let render_pass = {
         use gfx_hal::{
             image::Layout,
@@ -211,10 +254,11 @@ fn main() {
             pipelines: vec![pipeline],
             submission_complete_fence,
             rendering_complete_semaphore,
+            vertex_buffer_memory,
+            vertex_buffer,
         }));
 
     let start_time = std::time::Instant::now();
-
     event_loop.run(move |event, _, control_flow| match event {
         Event::WindowEvent { event, .. } => match event {
             WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
@@ -241,47 +285,10 @@ fn main() {
             let pipeline_layout = &res.pipeline_layouts[0];
             let pipeline = &res.pipelines[0];
 
-            let anim = start_time.elapsed().as_secs_f32().sin() * 0.5 + 0.5;
-            let small = [0.33, 0.33];
-
-            let triangles = &[
-                // Red
-                PushConstants {
-                    color: [1.0, 0.0, 0.0, 1.0],
-                    pos: [-0.5, -0.5],
-                    scale: small,
-                },
-                // Green
-                PushConstants {
-                    color: [0.0, 1.0, 0.0, 1.0],
-                    pos: [0.0, -0.5],
-                    scale: small,
-                },
-                // Blue
-                PushConstants {
-                    color: [0.0, 0.0, 1.0, 1.0],
-                    pos: [0.5, -0.5],
-                    scale: small,
-                },
-                // Blue <> Cyan
-                PushConstants {
-                    color: [0.0, anim, 1.0, 1.0],
-                    pos: [-0.5, 0.5],
-                    scale: small,
-                },
-                // Down <> Up
-                PushConstants {
-                    color: [1.0, 1.0, 1.0, 1.0],
-                    pos: [0.0, 0.5 - anim * 0.5],
-                    scale: small,
-                },
-                // Small <> Big
-                PushConstants {
-                    color: [1.0, 1.0, 1.0, 1.0],
-                    pos: [0.5, 0.5],
-                    scale: [0.33 + 0.33 * anim; 2],
-                },
-            ];
+            let angle = start_time.elapsed().as_secs_f32();
+            let teapots = &[PushConstants {
+                transform: make_transform([0.0, 0.0, 0.5], angle, 1.0),
+            }];
 
             unsafe {
                 use gfx_hal::pool::CommandPool;
@@ -373,6 +380,11 @@ fn main() {
                 command_buffer.set_viewports(0, &[viewport.clone()]);
                 command_buffer.set_scissors(0, &[viewport.rect]);
 
+                command_buffer.bind_vertex_buffers(
+                    0,
+                    vec![(&res.vertex_buffer, gfx_hal::buffer::SubRange::WHOLE)],
+                );
+
                 command_buffer.begin_render_pass(
                     render_pass,
                     &framebuffer,
@@ -386,18 +398,19 @@ fn main() {
                 );
 
                 command_buffer.bind_graphics_pipeline(pipeline);
-                // command_buffer.draw(0..3, 0..1);
-                for triangle in triangles {
+                for teapot in teapots {
                     use gfx_hal::pso::ShaderStageFlags;
 
                     command_buffer.push_graphics_constants(
                         pipeline_layout,
                         ShaderStageFlags::VERTEX,
                         0,
-                        push_constant_bytes(triangle),
+                        push_constant_bytes(teapot),
                     );
 
-                    command_buffer.draw(0..3, 0..1);
+                    let vertex_count = mesh.len() as u32;
+
+                    command_buffer.draw(0..vertex_count, 0..1);
                 }
                 command_buffer.end_render_pass();
                 command_buffer.finish();
@@ -428,6 +441,55 @@ fn main() {
     });
 }
 
+fn make_transform(translate: [f32; 3], angle: f32, scale: f32) -> [[f32; 4]; 4] {
+    let c = angle.cos() * scale;
+    let s = angle.sin() * scale;
+    let [dx, dy, dz] = translate;
+
+    [
+        [c, 0.0, s, 0.0],
+        [0.0, scale, 0.0, 0.0],
+        [-s, 0.0, c, 0.0],
+        [dx, dy, dz, 1.0],
+    ]
+}
+
+unsafe fn make_buffer<B: gfx_hal::Backend>(
+    device: &B::Device,
+    physical_device: &B::PhysicalDevice,
+    buffer_len: usize,
+    usage: gfx_hal::buffer::Usage,
+    properties: gfx_hal::memory::Properties,
+) -> (B::Memory, B::Buffer) {
+    use gfx_hal::{adapter::PhysicalDevice, MemoryTypeId};
+
+    let mut buffer = device
+        .create_buffer(buffer_len as u64, usage)
+        .expect("Failed to create buffer");
+
+    let req = device.get_buffer_requirements(&buffer);
+    let memory_types = physical_device.memory_properties().memory_types;
+    let memory_type = memory_types
+        .iter()
+        .enumerate()
+        .find(|(id, mem_type)| {
+            let type_supported = req.type_mask & (1_u64 << id.to_owned() as u64) != 0;
+            type_supported && mem_type.properties.contains(properties)
+        })
+        .map(|(id, _ty)| MemoryTypeId(id))
+        .expect("No compatible memory type found");
+
+    let buffer_memory = device
+        .allocate_memory(memory_type, req.size)
+        .expect("Failed to allocate buffer memory");
+
+    device
+        .bind_buffer_memory(&buffer_memory, 0, &mut buffer)
+        .expect("Failed to bind buffer memory");
+
+    (buffer_memory, buffer)
+}
+
 unsafe fn push_constant_bytes<T>(push_constants: &T) -> &[u32] {
     let size_bytes = std::mem::size_of::<T>();
     let size_u32 = size_bytes / std::mem::size_of::<u32>();
@@ -454,11 +516,14 @@ unsafe fn make_pipeline<B: gfx_hal::Backend>(
     vertex_shader: &str,
     fragment_shader: &str,
 ) -> B::GraphicsPipeline {
+    use gfx_hal::format::Format;
     use gfx_hal::pass::Subpass;
     use gfx_hal::pso::{
-        BlendState, ColorBlendDesc, ColorMask, EntryPoint, Face, GraphicsPipelineDesc,
-        GraphicsShaderSet, Primitive, Rasterizer, Specialization,
+        AttributeDesc, BlendState, ColorBlendDesc, ColorMask, Element, EntryPoint, Face,
+        GraphicsPipelineDesc, GraphicsShaderSet, Primitive, Rasterizer, Specialization,
+        VertexBufferDesc, VertexInputRate,
     };
+
     let vertex_shader_module = device
         .create_shader_module(&compile_shader(vertex_shader, ShaderType::Vertex))
         .expect("Failed to create vertex shader module");
@@ -497,6 +562,30 @@ unsafe fn make_pipeline<B: gfx_hal::Backend>(
             main_pass: render_pass,
         },
     );
+
+    pipeline_desc.vertex_buffers.push(VertexBufferDesc {
+        binding: 0,
+        stride: std::mem::size_of::<Vertex>() as u32,
+        rate: VertexInputRate::Vertex,
+    });
+
+    pipeline_desc.attributes.push(AttributeDesc {
+        location: 0,
+        binding: 0,
+        element: Element {
+            format: Format::Rgb32Sfloat,
+            offset: 0,
+        },
+    });
+
+    pipeline_desc.attributes.push(AttributeDesc {
+        location: 1,
+        binding: 0,
+        element: Element {
+            format: Format::Rgb32Sfloat,
+            offset: 12,
+        },
+    });
 
     pipeline_desc.blender.targets.push(ColorBlendDesc {
         mask: ColorMask::ALL,
